@@ -577,6 +577,48 @@ static ssize_t show_current(struct device *dev, struct device_attribute *attr, c
 static DEVICE_ATTR(getcurrent, 0644, show_current, NULL);
 
 
+static ssize_t show_accumulated_current(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct ds2784_device_info *di = dev_get_drvdata(dev);
+	long long n;
+	long long accumulated;
+	int check;
+
+	check = w1_ds2784_read(di->w1_slave, di->raw + DS2784_REG_ACCUMULATE_CURR_MSB, DS2784_REG_ACCUMULATE_CURR_MSB, 4);
+
+	if (check != 4) {
+	    dev_warn(di->dev, "w1_ds2784_read Accumulated current failed (ox%p)\n", di->w1_slave);
+	}
+
+	n = (di->raw[DS2784_REG_ACCUMULATE_CURR_MSB] << 24)
+          | (di->raw[DS2784_REG_ACCUMULATE_CURR_LSB] << 16)
+          | (di->raw[DS2784_REG_ACCUMULATE_CURR_LSB1] << 8)
+          | (di->raw[DS2784_REG_ACCUMULATE_CURR_LSB2]);
+
+        // According to http://datasheets.maxim-ic.com/en/ds/DS2784.pdf
+        // accumulated current units is 6.25 uVh/RSNS
+        // convert to uVs by multiply with 3600.
+        // The result is in uAs (microAmpsSecond).
+        accumulated = (n * (625 * 36 * BATT_RSNSP)) >> 16;
+
+	return sprintf(buf, "%lld\n", accumulated);
+}
+
+
+static ssize_t set_accumulated_current(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+    // writing anything just resets the accumulatedCurrent to zero
+    struct ds2784_device_info *di = dev_get_drvdata(dev);
+    di->raw[DS2784_REG_ACCUMULATE_CURR_MSB]  = 0;
+    di->raw[DS2784_REG_ACCUMULATE_CURR_LSB]  = 0;
+    di->raw[DS2784_REG_ACCUMULATE_CURR_LSB1] = 0;
+    di->raw[DS2784_REG_ACCUMULATE_CURR_LSB2] = 0;
+    w1_ds2784_write(di->w1_slave, di->raw + DS2784_REG_ACCUMULATE_CURR_MSB, DS2784_REG_ACCUMULATE_CURR_MSB, 2);
+    return count;
+}
+
+static DEVICE_ATTR(accumulatedCurrent, 0644, show_accumulated_current, set_accumulated_current);
+
 static ssize_t show_avgcurrent(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct ds2784_device_info *di = dev_get_drvdata(dev);
@@ -1033,6 +1075,10 @@ static int ds2784_battery_probe(struct platform_device *pdev)
 	ret = device_create_file(&pdev->dev, &dev_attr_getcurrent);
 	if (ret < 0)
 	    pr_err("%s: Failed to create sysfs entry for current\n", __func__);
+
+	ret = device_create_file(&pdev->dev, &dev_attr_accumulatedCurrent);
+	if (ret < 0)
+	    pr_err("%s: Failed to create sysfs entry for accumulated\n", __func__);
 
 	ret = device_create_file(&pdev->dev, &dev_attr_getavgcurrent);
 	if (ret < 0)
