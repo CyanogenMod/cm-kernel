@@ -25,6 +25,7 @@
 #include "yaffs_packedtags2.h"
 
 #include "yaffs_linux.h"
+#include "yaffs_crypto.h"
 
 /* NB For use with inband tags....
  * We assume that the data buffer is of size total_bytes_per_chunk so that we can also
@@ -41,6 +42,8 @@ int nandmtd2_write_chunk_tags(struct yaffs_dev *dev, int nand_chunk,
 	loff_t addr;
 
 	struct yaffs_packed_tags2 pt;
+
+	u8 *encrypted_data = NULL;
 
 	int packed_tags_size =
 	    dev->param.no_tags_ecc ? sizeof(pt.t) : sizeof(pt);
@@ -70,13 +73,32 @@ int nandmtd2_write_chunk_tags(struct yaffs_dev *dev, int nand_chunk,
 		yaffs_pack_tags2(&pt, tags, !dev->param.no_tags_ecc);
         }
 
+	if (dev->is_encrypted_fs) {
+		if (dev->param.inband_tags)
+			BUG();
+
+		encrypted_data = yaffs_get_temp_buffer(dev, __LINE__);
+		memcpy(encrypted_data, data, dev->param.total_bytes_per_chunk);
+
+		AES_xts_encrypt(dev->cipher,
+				encrypted_data, encrypted_data,
+				nand_chunk * 2, dev->param.total_bytes_per_chunk,
+				packed_tags_ptr+SEQUENCE_OFFSET,
+				packed_tags_ptr+SEQUENCE_OFFSET,
+				(nand_chunk * 2) + 1,
+				packed_tags_size-SEQUENCE_OFFSET);
+	}
+
 	ops.mode = MTD_OOB_AUTO;
 	ops.ooblen = (dev->param.inband_tags) ? 0 : packed_tags_size;
 	ops.len = dev->param.total_bytes_per_chunk;
 	ops.ooboffs = 0;
-	ops.datbuf = (u8 *) data;
+	ops.datbuf = dev->is_encrypted_fs ? encrypted_data : (u8 *) data;
 	ops.oobbuf = (dev->param.inband_tags) ? NULL : packed_tags_ptr;
 	retval = mtd->write_oob(mtd, addr, &ops);
+
+	if (dev->is_encrypted_fs && encrypted_data)
+		yaffs_release_temp_buffer(dev, encrypted_data, __LINE__);
 
 	if (retval == 0)
 		return YAFFS_OK;
@@ -91,6 +113,10 @@ int nandmtd2_read_chunk_tags(struct yaffs_dev *dev, int nand_chunk,
 	struct mtd_oob_ops ops;
 
 	size_t dummy;
+
+	struct yaffs_ext_tags placeholder_tags;
+	u8 *encrypted_data = NULL;
+
 	int retval = 0;
 	int local_data = 0;
 
@@ -116,20 +142,32 @@ int nandmtd2_read_chunk_tags(struct yaffs_dev *dev, int nand_chunk,
 
 	}
 
-	if (dev->param.inband_tags || (data && !tags))
+	if (dev->is_encrypted_fs) {
+		encrypted_data = yaffs_get_temp_buffer(dev, __LINE__);
+
+		if (!tags)
+			tags = &placeholder_tags;
+	}
+
+	if (dev->param.inband_tags || (data && !tags)) {
+		if (dev->is_encrypted_fs)
+			BUG();
+
 		retval = mtd->read(mtd, addr, dev->param.total_bytes_per_chunk,
 				   &dummy, data);
-	else if (tags) {
+	} else if (tags) {
 		ops.mode = MTD_OOB_AUTO;
 		ops.ooblen = packed_tags_size;
-		ops.len = data ? dev->data_bytes_per_chunk : packed_tags_size;
+		ops.len = (data || encrypted_data) ? dev->data_bytes_per_chunk : packed_tags_size;
 		ops.ooboffs = 0;
-		ops.datbuf = data;
+		ops.datbuf = dev->is_encrypted_fs ? encrypted_data : data;
 		ops.oobbuf = yaffs_dev_to_lc(dev)->spare_buffer;
 		retval = mtd->read_oob(mtd, addr, &ops);
 	}
 
 	if (dev->param.inband_tags) {
+		if (dev->is_encrypted_fs)
+			BUG();
 		if (tags) {
 			struct yaffs_packed_tags2_tags_only *pt2tp;
 			pt2tp =
@@ -142,6 +180,27 @@ int nandmtd2_read_chunk_tags(struct yaffs_dev *dev, int nand_chunk,
 			memcpy(packed_tags_ptr,
 			       yaffs_dev_to_lc(dev)->spare_buffer,
 			       packed_tags_size);
+
+			if (dev->is_encrypted_fs) {
+				if (pt.t.seq_number != 0xFFFFFFFF) {
+					AES_xts_decrypt(dev->cipher,
+							encrypted_data,
+							encrypted_data,
+							nand_chunk * 2,
+							dev->data_bytes_per_chunk,
+							packed_tags_ptr+SEQUENCE_OFFSET,
+							packed_tags_ptr+SEQUENCE_OFFSET,
+							(nand_chunk * 2) + 1,
+							packed_tags_size-SEQUENCE_OFFSET);
+				}
+
+				if (data)
+					memcpy(data, encrypted_data,
+                                               dev->param.total_bytes_per_chunk);
+
+				yaffs_release_temp_buffer(dev, encrypted_data, __LINE__);
+			}
+
 			yaffs_unpack_tags2(tags, &pt, !dev->param.no_tags_ecc);
 		}
 	}
